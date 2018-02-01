@@ -1,11 +1,11 @@
 import matplotlib.pyplot as plt
 from os import path
 
-from samri.pipelines import fc
+from samri.analysis import fc
 from samri.utilities import bids_substitution_iterator
 from samri.fetch.local import roi_from_atlaslabel
 from samri.plotting import maps, connectivity
-from samri.report import aggregate
+from samri.analysis import fc
 
 def overview(workflow, identifiers,
 	cut_coords=[None, [0,-4.5,-3.3]],
@@ -35,41 +35,32 @@ def overview(workflow, identifiers,
 		save_as=save_as,
 		)
 
-def blur_kernel_compare_dr(conditions=["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"], parameters=["level2_dgamma","level2_dgamma_blurxy4","level2_dgamma_blurxy5", "level2_dgamma_blurxy6", "level2_dgamma_blurxy7"], threshold=3):
-	from matplotlib.backends.backend_pdf import PdfPages
-	pp = PdfPages('~/DR.pdf')
-	for condition in conditions:
-		stat_maps = ["~/ni_data/ofM.dr/GLM/"+parameter+"/_category_multi_"+condition+"/flameo/mapflow/_flameo0/stats/tstat1.nii.gz" for parameter in parameters]
-		titles = [stat_map[32:-43] for stat_map in stat_maps]
-		maps.stat(stat_maps, cut_coords=(-49,8,43), threshold=threshold, interpolation="none", template="~/ni_data/templates/hires_QBI_chr.nii.gz", save_as=pp, figure_title=condition, subplot_titles=parameters)
-	pp.close()
-
 def plot_roi_per_session(l1_dir, roi_mask, color,
 	roi_mask_normalize="",
 	):
 	from samri.plotting import summary
 	from samri.report import roi
-	
+
 	substitutions = bids_substitution_iterator(
 		["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"],
-		# ["5689","5690","5691"],
-		["4005","5687","4007","4011","4012","5689","5690","5691"],
+		# ["5689","5690","5700"],
+		["6262","6255","5694","5706",'5704'],
 		# ["4007","4011","4012","5689","5690","5691"],
 		# ["4009","4011","4012","5689","5690","5691"],
 		# ["4008","4009","4011","4012",],
-		["EPI_CBV_jb_long","EPI_CBV_chr_longSOA"],
+		["EPI_CBV_chr_longSOA"],
 		"~/ni_data/ofM.dr/",
 		"",
 		l1_dir=l1_dir,
 		)
-	
+
 	if isinstance(roi, list) and not "/" in roi[0]:
 		roi = roi_from_atlaslabel("~/ni_data/templates/roi/DSURQEc_200micron_labels.nii",
 			mapping="~/ni_data/templates/roi/DSURQE_mapping.csv",
 			label_names=roi,
 			)
-	fit, anova, subjectdf, voxeldf = roi.roi_per_session(substitutions,
-		t_file_template="{data_dir}/l1/{l1_dir}/sub-{subject}/ses-{session}/sub-{subject}_ses-{session}_trial-{scan}_tstat.nii.gz",
+	fit, anova, subjectdf, voxeldf = roi.per_session(substitutions,
+		t_file_template="{data_dir}/l1/{l1_dir}/sub-{subject}/ses-{session}/sub-{subject}_ses-{session}_trial-{trial}_tstat.nii.gz",
 		roi_mask=roi_mask,
 		roi_mask_normalize=roi_mask_normalize,
 		)
@@ -102,20 +93,6 @@ def p_clusters(mask):
 	timeseries.multi(timecourses, designs, stat_maps, events_dfs, subplot_titles, figure="timecourses")
 	plt.show()
 
-def roi(roi_path="~/ni_data/templates/roi/f_dr_chr.nii.gz"):
-	from samri.plotting import summary, timeseries
-
-	substitutions = bids_substitution_iterator(
-		["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"],
-		[4007,4008,4009,4011,4012],
-		["EPI_CBV_jb_long"],
-		"~/ni_data/ofM.dr/",
-		"composite",
-		)
-	timecourses, designs, stat_maps, subplot_titles = summary.roi_ts(substitutions, roi_path=roi_path,)
-	timeseries.multi(timecourses, designs, stat_maps, subplot_titles, figure="timecourses")
-	plt.show()
-
 def roi_teaching(roi_path="~/ni_data/templates/roi/f_dr_chr.nii.gz"):
 	from samri.plotting import timeseries
 
@@ -133,14 +110,14 @@ def roi_teaching(roi_path="~/ni_data/templates/roi/f_dr_chr.nii.gz"):
 def check_responders():
 	from samri.plotting import summary
 
-	summary.responders("subjectwise_composite")
+	summary.responders("composite_subjects")
 
 def qc_regressor(sessions, subjects, scans, workflow_name, mask,
 	data_dir="~/ni_data/ofM.dr",
 	save_as="",
 	):
 	from samri.plotting import summary, timeseries
-	plt.style.use('samri_mts.conf')
+	plt.style.use('samri_multiple-ts.conf')
 
 	substitutions = bids_substitution_iterator(sessions,subjects,scans,data_dir,workflow_name)
 	timecourses, designs, stat_maps, events_dfs, subplot_titles = summary.ts_overviews(substitutions, mask,
@@ -156,99 +133,91 @@ def qc_regressor(sessions, subjects, scans, workflow_name, mask,
 		save_as=save_as,
 		)
 
-def plot_my_roi():
-	maps.atlas_label("~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
-		)
-	plt.show()
-
-def plot_roi_by_label(label_names,
-	save_as="",
-	):
-	roi = roi_from_atlaslabel("~/ni_data/templates/roi/DSURQEc_200micron_labels.nii",
-		mapping="~/ni_data/templates/roi/DSURQE_mapping.csv",
-		label_names=label_names,
-		save_as=save_as
-		)
-	maps.atlas_label(roi)
-	plt.show()
-	# roi_per_session("as_composite", roi, "#e66633")
-
 def single_ts_seed_connectivity(
 	template="~/ni_data/templates/DSURQEc_40micron_masked.nii.gz",
-	save_as=""
+	save_as="fcs.pdf"
 	):
-	# connectivity_img = fc.seed_based_connectivity(
-	# 	"~/ni_data/ofM.dr/preprocessing/as_composite/sub-5689/ses-ofM/func/sub-5689_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5706/ses-ofM_aF/func/sub-5706_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5690/ses-ofM/func/sub-5690_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-4011/ses-ofM_aF/func/sub-4011_ses-ofM_aF_trial-EPI_CBV_jb_long.nii.gz",
-	# 	"~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
-	# 	save_as="~/fc.nii.gz"
-	# )
-	# connectivity_img1 = fc.seed_based_connectivity(
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5689/ses-ofM/func/sub-5689_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5706/ses-ofM_aF/func/sub-5706_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	"~/ni_data/ofM.dr/preprocessing/as_composite/sub-5690/ses-ofM/func/sub-5690_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-4011/ses-ofM_aF/func/sub-4011_ses-ofM_aF_trial-EPI_CBV_jb_long.nii.gz",
-	# 	"~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
-	# 	save_as="~/fc.nii.gz"
-	# )
 	connectivity_img2 = fc.seed_based_connectivity(
-		# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5689/ses-ofM/func/sub-5689_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
-		# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5706/ses-ofM_aF/func/sub-5706_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-		"~/ni_data/ofM.dr/preprocessing/as_composite/sub-5690/ses-ofM_aF/func/sub-5690_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-		# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-4011/ses-ofM_aF/func/sub-4011_ses-ofM_aF_trial-EPI_CBV_jb_long.nii.gz",
+		"~/ni_data/ofM.dr/preprocessing/composite/sub-6255/ses-ofM/func/sub-6255_ses-ofM_trial-EPI_CBV_chr_longSOA.nii.gz",
 		"~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
 		save_as="~/fc.nii.gz"
 	)
-	stat_maps=[connectivity_img2]
-	# stat_maps=[connectivity_img,connectivity_img,"~/fc.nii.gz",connectivity_img1,connectivity_img1, connectivity_img2,]
-	# stat_maps=[connectivity_img,connectivity_img,]
+	stat_maps=[connectivity_img2,connectivity_img2]
 	maps.stat(stat_maps,
 		template=template,
 		threshold=0.1,
-		orientation="landscape",
-		# cut_coords=[None,],
-		cut_coords=[None,[0,-4.5,-3.3],None,[0,-4.5,-3.3],None,None],
-		# cut_coords=[None,[0,-4.5,-3.3],],
+		shape="landscape",
+		cut_coords=[None,[0,-4.9,-3.3]],
 		overlays=["~/ni_data/templates/roi/DSURQEc_dr.nii.gz",],
 		save_as=save_as,
-		scale=0.8,
+		scale=0.6,
 		dim=0.8,
 		)
 
 def seed_connectivity_overview(
 	template="~/ni_data/templates/DSURQEc_40micron_masked.nii.gz",
+	cut_coords=[None,[0,-4.9,-3.3]],
+	plot=False,
 	):
+	import numpy as np
+	from labbookdb.report.tracking import treatment_group, append_external_identifiers
+	from samri.plotting.overview import multiplot_matrix, multipage_plot
+
+	db_path = '~/syncdata/meta.db'
+	groups = treatment_group(db_path, ['cFluDW','cFluDW_'], 'cage')
+	groups = append_external_identifiers(db_path, groups, ['Genotype_code'])
+	all_subjects = groups['ETH/AIC'].unique()
+	treatment = groups[
+			(groups['Genotype_code']=="eptg")&
+			(groups['Cage_TreatmentProtocol_code']=="cFluDW")
+			]['ETH/AIC'].tolist()
+	no_treatment = groups[
+			(groups['Genotype_code']=="eptg")&
+			(groups['Cage_TreatmentProtocol_code']=="cFluDW_")
+			]['ETH/AIC'].tolist()
+	negative_controls = groups[groups['Genotype_code']=="epwt"]['ETH/AIC'].tolist()
+	print(treatment, no_treatment, negative_controls)
 	substitutions = bids_substitution_iterator(
 		["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"],
-		# ["5689","5690","5691"],
-		["4005","5687","4007","4011","4012","5689","5690","5691"],
-		# ["4007","4011","4012","5689","5690","5691"],
-		# ["4009","4011","4012","5689","5690","5691"],
-		# ["4008","4009","4011","4012",],
-		["EPI_CBV_jb_long","EPI_CBV_chr_longSOA"],
+		all_subjects,
+		["EPI_CBV_chr_longSOA",],
 		"~/ni_data/ofM.dr/",
-		"as_composite",
+		"composite",
 		)
-	subjectdf, voxeldf = aggregate.seed_fc_rois(substitutions, "~/ni_data/templates/roi/DSURQEc_dr.nii.gz", "~/ni_data/templates/roi/DSURQEc_ctx.nii.gz",
-		ts_file_template="~/ni_data/ofM.dr/preprocessing/{preprocessing_dir}/sub-{subject}/ses-{session}/func/sub-{subject}_ses-{session}_trial-{scan}.nii.gz",
+	fc_results = fc.seed_based(substitutions, "~/ni_data/templates/roi/DSURQEc_dr_xs.nii.gz", "~/ni_data/templates/DSURQEc_200micron_mask.nii.gz",
+		ts_file_template="~/ni_data/ofM.dr/preprocessing/{preprocessing_dir}/sub-{subject}/ses-{session}/func/sub-{subject}_ses-{session}_trial-{trial}.nii.gz",
 		)
 
-	# connectivity_img = fc.seed_based_connectivity(
-	# 	"~/ni_data/ofM.dr/preprocessing/as_composite/sub-5706/ses-ofM_aF/func/sub-5706_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-5690/ses-ofM_aF/func/sub-5690_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
-	# 	# "~/ni_data/ofM.dr/preprocessing/as_composite/sub-4011/ses-ofM_aF/func/sub-4011_ses-ofM_aF_trial-EPI_CBV_jb_long.nii.gz",
-	# 	"~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
-	# )
-	# stat_maps=[connectivity_img,connectivity_img]
-	# maps.stat(stat_maps,
-	# 	template=template,
-	# 	threshold=0.1,
-	# 	orientation="portrait",
-	# 	cut_coords=[None,[0,-4.5,-3.3]],
-	# 	overlays=["~/ni_data/templates/roi/DSURQEc_dr.nii.gz",],
-	# 	)
+	print([i['subject'] for i in fc_results])
+	return
+	if plot:
+		multipage_plot(fc_results, treatment,
+			figure_title="Chronic Fluoxetine (drinking water) Treatment Group",
+			template=template,
+			threshold=0.1,
+			base_cut_coords=cut_coords,
+			save_as="fc_treatment.pdf",
+			overlays=['~/ni_data/templates/roi/DSURQEc_dr_xs.nii.gz'],
+			scale=0.4,
+			)
+		multipage_plot(fc_results, no_treatment,
+			figure_title="Chronic Fluoxetine (drinking water) Treatment Group",
+			template=template,
+			threshold=0.1,
+			base_cut_coords=cut_coords,
+			save_as="fc_no_treatment.pdf",
+			overlays=['~/ni_data/templates/roi/DSURQEc_dr_xs.nii.gz'],
+			scale=0.4,
+			)
+		multipage_plot(fc_results, negative_controls,
+			figure_title="Chronic Fluoxetine (drinking water) Treatment Group",
+			template=template,
+			threshold=0.1,
+			base_cut_coords=cut_coords,
+			save_as="fc_negative_control.pdf",
+			overlays=['~/ni_data/templates/roi/DSURQEc_dr_xs.nii.gz'],
+			scale=0.4,
+			)
 
 def functional_connectivity(ts="~/ni_data/ofM.dr/preprocessing/as_composite/sub-5690/ses-ofM_aF/func/sub-5690_ses-ofM_aF_trial-EPI_CBV_chr_longSOA.nii.gz",
 	labels_img='~/ni_data/templates/roi/DSURQEc_40micron_labels.nii',
@@ -260,45 +229,16 @@ def functional_connectivity(ts="~/ni_data/ofM.dr/preprocessing/as_composite/sub-
 	figsize = (50,50)
 	# incl. plotting
 	correlation_matrix = fc.correlation_matrix(ts, labels_img, save_as = '~/correlation_matrix.csv')
-	#TODO: to test with confounds 
+	#TODO: to test with confounds
 	#correlation_matrix = fc.correlation_matrix(ts, '~/confounds.csv', labels_img, save_as = '~/correlation_matrix.csv')
 	connectivity.plot_connectivity_matrix(correlation_matrix, figsize, labels, save_as = '~/correlation_matrix.png')
 
-
-
 if __name__ == '__main__':
-	# overview("as_composite_subjects", ["4001","4005","4007","4008","4009","4011","4012","5687","5689","5690","5691","5703","5704","5706"],) #4001 is a negative control (transgene but no injection
-	# overview("as_composite_subjects", ["4007","4008","4009","4011","4012","5689","5690","5691"],) #4001 is a negative control (transgene but no injection
-	# overview("as_composite_sessions_responders", ["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"],cut_coords=[0,-4.3,-3.3])
-	# overview("as_composite_sessions_best_responders", ["ofM","ofM_aF","ofM_cF1","ofM_cF2","ofM_pF"],cut_coords=[0,-4.3,-3.3])
-	# overview("composite_subjects", ["4007","4008","4011","4012","5689","5690","5691"], template="~/ni_data/templates/ds_QBI_chr.nii.gz") #4001 is a negative control (transgene but no injection
-	# overview("composite_subjects", ["4001","4005","4007","4008","4009","4011","4012"]) #4001 is a negative control (transgene but no injection
-	# overview("as_composite_subjects", ["4001","4005","4007","4008","4009","4011","4012"])
-	# overview("as_composite_subjects", ["4012","5687","5689","5690","5691","5703","5704","5706"])
-	# overview("as_composite_subjects", ["4012","5687","5689","5690","5691","5703"])
-	# single_ts_seed_connectivity(save_as="~/11.png")
-	# overview("as_composite_subjects", ["4012"], orientation="landscape",save_as="~/12.png")
-	# overview("as_composite_subjects", ["4012"], orientation="portrait", save_as="~/21.png")
-	# overview("as_composite_subjects", ["4012","5687"], save_as="~/22.png")
-	# overview("as_composite_subjects", ["4012","5687","5689","5690"], save_as="~/42.png")
-	# overview("as_composite_subjects", ["4012","5687","5689","5690","5691","5703"], save_as="~/62.png")
-
 	# seed_connectivity_overview()
 	# single_ts_seed_connectivity(save_as="~/sbfc.pdf")
 
-	# plot_roi_by_label(["medulla","midbrain","pons"],"chr_brainstem")
-	# plot_my_roi()
-
-	# roi_per_session("composite", "~/ni_data/templates/roi/ctx_chr_bin.nii.gz", "#56B4E9")
-	# roi_per_session("as_composite", ["cortex"], "#e66633")
-	# roi_per_session("as_composite", ["frontal","Frontal","orbital","Orbital"], "#e66633")
-	# roi_per_session("as_composite", "~/ni_data/templates/roi/DSURQEc_ctx.nii.gz", "#56B4E9",
-	# 	roi_mask_normalize="~/ni_data/templates/roi/DSURQEc_dr.nii.gz",
-	# 	)
-	plot_roi_per_session("as_composite", "~/ni_data/templates/roi/DSURQEc_dr.nii.gz", "#E69F00")
-	# roi_per_session("as_composite", "~/ni_data/templates/roi/f_dr_chr_bin.nii.gz", "#E69F00")
+	plot_roi_per_session("composite", "~/ni_data/templates/roi/DSURQEc_dr.nii.gz", "#E69F00")
 	# p_clusters("~/ni_data/templates/ds_QBI_chr_bin.nii.gz")
-	# roi(roi_path="~/ni_data/templates/roi/f_dr_chr_bin.nii.gz")
 	# roi_teaching()
 	# check_responders()
 	#qc_regressor(
@@ -310,6 +250,4 @@ if __name__ == '__main__':
 	#	save_as="qc_regressor.pdf",
 	#	)
 	# qc_regressor(["ofM_cF1"],["4011"],["EPI_CBV_jb_long"],"as_composite","~/ni_data/templates/roi/DSURQEc_ctx.nii.gz")
-	# network.simple_dr(output="~/ntw1.png", graphsize=800, scale=1.8)
-	#plt.show()
-	#functional_connectivity()
+	plt.show()

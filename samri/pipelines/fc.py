@@ -1,229 +1,156 @@
-import nibabel
-import numpy as np
+from os import path, listdir, getcwd, remove
+
+import inspect
+import re
+import shutil
+from copy import deepcopy
+from itertools import product
+
+import argh
+import nipype.interfaces.ants as ants
 import nipype.interfaces.io as nio
-from os import path
+import nipype.interfaces.utility as util		# utility
+import nipype.pipeline.engine as pe				# pypeline engine
+import pandas as pd
+from nipype.interfaces import fsl, nipy, bru2nii
 
+from samri.pipelines.extra_functions import force_dummy_scans, get_tr
+from samri.pipelines.nodes import functional_registration, structural_registration, composite_registration
+from samri.pipelines.utils import out_path, container
+from samri.utilities import N_PROCS
 
-from nilearn.input_data import NiftiMasker, NiftiLabelsMasker
-from nilearn.connectome import ConnectivityMeasure
-from nipype.interfaces import fsl
+#set all outputs to compressed NIfTI
+fsl.FSLCommand.set_default_output_type('NIFTI_GZ')
 
-def dual_regression(substitutions_a, substitutions_b,
-	all_merged_path="~/all_merged.nii.gz",
-	components=9,
-	group_level="concat",
-	tr=1,
-	ts_file_template="{data_dir}/preprocessing/{preprocessing_dir}/sub-{subject}/ses-{session}/func/sub-{subject}_ses-{session}_trial-{scan}.nii.gz",
+def seed_based(bids_base,
+	seed_mask=None,
+	debug=False,
+	exclude={},
+	include={},
+	keep_crashdump=False,
+	keep_work=False,
+	match_regex='.+/sub-(?P<sub>[a-zA-Z0-9]+)/ses-(?P<ses>[a-zA-Z0-9]+)/.*?_acq-(?P<acq>[a-zA-Z0-9]+)_trial-(?P<trial>[a-zA-Z0-9]+)_(?P<mod>[a-zA-Z0-9]+).(?:nii|nii\.gz)',
+	n_procs=N_PROCS,
+	workflow_name="diagnostic",
 	):
-
-	all_merged_path = path.abspath(path.expanduser(all_merged_path))
-
-	ts_a = []
-	for substitution in substitutions_a:
-		ts_a.append(path.abspath(path.expanduser(ts_file_template.format(**substitution))))
-	ts_b = []
-	for substitution in substitutions_b:
-		ts_b.append(path.abspath(path.expanduser(ts_file_template.format(**substitution))))
-
-	ts_all = ts_a + ts_b
-	if group_level == "concat" and not path.isfile(all_merged_path):
-		ts_all_merged = nibabel.concat_images(ts_all, axis=3)
-		ts_all_merged.to_filename(all_merged_path)
-
-	ica = fsl.model.MELODIC()
-	ica.inputs.report = True
-	ica.inputs.tr_sec = tr
-	ica.inputs.no_bet = True
-	ica.inputs.no_mask = True
-	ica.inputs.sep_vn = True
-	if components:
-		ica.inputs.dim = int(components)
-	if group_level == "migp":
-		ica.inputs.in_files = ts_all
-		ica._cmd = 'melodic --migp'
-	elif group_level == "concat":
-		ica.inputs.approach = "concat"
-		ica.inputs.in_files = all_merged_path
-	print(ica.cmdline)
-	ica_run = ica.run()
-
-def get_signal(substitutions_a, substitutions_b,
-	functional_file_template="~/ni_data/ofM.dr/preprocessing/{preprocessing_dir}/sub-{subject}/ses-{session}/func/sub-{subject}_ses-{session}_trial-{scan}.nii.gz",
-	mask="~/ni_data/templates/DSURQEc_200micron_bin.nii.gz",
-	):
-
-	mask = path.abspath(path.expanduser(mask))
-
-	out_t_names = []
-	out_cope_names = []
-	out_varcb_names = []
-	for substitution in substitutions_a+substitutions_b:
-		ts_name = path.abspath(path.expanduser("{subject}_{session}.mat".format(**substitution)))
-		out_t_name = path.abspath(path.expanduser("{subject}_{session}_tstat.nii.gz".format(**substitution)))
-		out_cope_name = path.abspath(path.expanduser("{subject}_{session}_cope.nii.gz".format(**substitution)))
-		out_varcb_name = path.abspath(path.expanduser("{subject}_{session}_varcb.nii.gz".format(**substitution)))
-		out_t_names.append(out_t_name)
-		out_cope_names.append(out_cope_name)
-		out_varcb_names.append(out_varcb_name)
-		functional_file = path.abspath(path.expanduser(functional_file_template.format(**substitution)))
-		if not path.isfile(ts_name):
-			masker = NiftiMasker(mask_img=mask)
-			ts = masker.fit_transform(functional_file).T
-			ts = np.mean(ts, axis=0)
-			header = "/NumWaves 1\n/NumPoints 1490\n/PPheights 1.308540e+01 4.579890e+00\n\n/Matrix"
-			np.savetxt(ts_name, ts, delimiter="\n", header=header, comments="")
-		glm = fsl.GLM(in_file=functional_file, design=ts_name, output_type='NIFTI_GZ')
-		glm.inputs.contrasts = path.abspath(path.expanduser("run0.con"))
-		glm.inputs.out_t_name = out_t_name
-		glm.inputs.out_cope = out_cope_name
-		glm.inputs.out_varcb_name = out_varcb_name
-		print(glm.cmdline)
-		glm_run=glm.run()
-
-	copemerge = fsl.Merge(dimension='t')
-	varcopemerge = fsl.Merge(dimension='t')
-
-def seed_based_connectivity(ts, seed_mask,
-	anat_path="~/ni_data/templates/DSURQEc_40micron_masked.nii.gz",
-	brain_mask="~/ni_data/templates/DSURQEc_200micron_mask.nii.gz",
-	smoothing_fwhm=.3,
-	detrend=True,
-	standardize=True,
-	low_pass=0.25,
-	high_pass=0.004,
-	tr=1.,
-	save_as="",
-	):
-	"""Return a NIfTI containing z scores for connectivity to a defined seed region
+	'''Create seed-based functional connectivity maps based on a GLM timecourse analysis (with FSL's FLAMEO) for a given seed mask and a given BIDS-formatted directory tree.
 
 	Parameters
 	----------
 
-	ts : string
-	Path to the 4D NIfTI timeseries file on which to perform the connectivity analysis.
+	bids_base : string, optional
+		Path to the top level of a BIDS directory tree for which to perform the diagnostic.
+	debug : bool, optional
+		Enable full nipype debugging support for the workflow construction and execution.
+	exclude : dict, optional
+		A dictionary with any subset of 'subject', 'session', 'acquisition', 'trial', 'modality', and 'path' as keys and corresponding identifiers as values.
+		This is a blacklist: if this is specified only non-matching entries will be included in the analysis.
+	include : dict, optional
+		A dictionary with any subset of 'subject', 'session', 'acquisition', 'trial', 'modality', and 'path' as keys and corresponding identifiers as values.
+		This is a whitelist: if this is specified only matching entries will be included in the analysis.
+	keep_crashdump : bool, optional
+		Whether to keep the crashdump directory (containing all the crash reports for intermediary workflow steps, as managed by nipypye).
+		This is useful for debugging and quality control.
+	keep_work : bool, optional
+		Whether to keep the work directory (containing all the intermediary workflow steps, as managed by nipypye).
+		This is useful for debugging and quality control.
+	match_regex : str, optional
+		Regex matching pattern by which to select input files. Has to contain groups named "sub", "ses", "acq", "trial", and "mod".
+	n_procs : int, optional
+		Maximum number of processes which to simultaneously spawn for the workflow.
+		If not explicitly defined, this is automatically calculated from the number of available cores and under the assumption that the workflow will be the main process running for the duration that it is running.
+	workflow_name : string, optional
+		Name of the workflow execution. The output will be saved one level above the bids_base, under a directory bearing the name given here.
+	'''
 
-	seed_mask : string
-	Path to a 3D NIfTI-like binary mask file designating the seed region.
+	bids_base = path.abspath(path.expanduser(bids_base))
 
-	smoothing_fwhm : float, optional
-	Spatial smoothing kernel, passed to the NiftiMasker.
+	datafind = nio.DataFinder()
+	datafind.inputs.root_paths = bids_base
+	datafind.inputs.match_regex = match_regex
+	datafind_res = datafind.run()
 
-	detrend : bool, optional
-	Whether to detrend the data, passed to the NiftiMasker.
+	data_selection = zip(*[datafind_res.outputs.sub, datafind_res.outputs.ses, datafind_res.outputs.acq, datafind_res.outputs.trial, datafind_res.outputs.mod, datafind_res.outputs.out_paths])
+	data_selection = [list(i) for i in data_selection]
+	data_selection = pd.DataFrame(data_selection,columns=('subject','session','acquisition','trial','modality','path'))
 
-	standardize : bool, optional
-	Whether to standardize the data (make mean 0. and variance 1.), passed to the NiftiMasker.
+	data_selection = data_selection.sort_values(['session', 'subject'], ascending=[1, 1])
+	if exclude:
+		for key in exclude:
+			data_selection = data_selection[~data_selection[key].isin(exclude[key])]
+	if include:
+		for key in include:
+			data_selection = data_selection[data_selection[key].isin(include[key])]
 
-	low_pass : float, optional
-	Low-pass cut-off, passed to the NiftiMasker.
-
-	high_pass : float, optional
-	High-pass cut-off, passed to the NiftiMasker.
-
-	tr : float, optional
-	Repetition time, passed to the NiftiMasker.
-
-	save_as : string, optional
-	Path to save a NIfTI of the functional connectivity zstatistic to.
-
-	Notes
-	-----
-
-	Contains sections of code copied from the nilearn examples:
-	http://nilearn.github.io/auto_examples/03_connectivity/plot_seed_to_voxel_correlation.html#sphx-glr-auto-examples-03-connectivity-plot-seed-to-voxel-correlation-py
-	"""
-
-	anat_path = path.abspath(path.expanduser(anat_path))
-	brain_mask = path.abspath(path.expanduser(brain_mask))
-	seed_mask = path.abspath(path.expanduser(seed_mask))
-	save_as = path.abspath(path.expanduser(save_as))
-	ts = path.abspath(path.expanduser(ts))
-
-	seed_masker = NiftiMasker(
-		mask_img=seed_mask,
-		smoothing_fwhm=smoothing_fwhm,
-		detrend=detrend,
-		standardize=standardize,
-		low_pass=low_pass,
-		high_pass=high_pass,
-		t_r=tr,
-		memory='nilearn_cache', memory_level=1, verbose=0
-		)
-	brain_masker = NiftiMasker(
-		mask_img=brain_mask,
-		smoothing_fwhm=smoothing_fwhm,
-		detrend=detrend,
-		standardize=standardize,
-		low_pass=low_pass,
-		high_pass=high_pass,
-		t_r=tr,
-		memory='nilearn_cache', memory_level=1, verbose=0
-		)
-	seed_time_series = seed_masker.fit_transform(ts,).T
-	seed_time_series = np.mean(seed_time_series, axis=0)
-	brain_time_series = brain_masker.fit_transform(ts,)
-
-	seed_based_correlations = np.dot(brain_time_series.T, seed_time_series) / seed_time_series.shape[0]
-	try:
-		print("seed-based correlation shape: (%s, %s)" % seed_based_correlations.shape)
-	except TypeError:
-		print("seed-based correlation shape: (%s, )" % seed_based_correlations.shape)
-	print("seed-based correlation: min = %.3f; max = %.3f" % (seed_based_correlations.min(), seed_based_correlations.max()))
-
-	seed_based_correlations_fisher_z = np.arctanh(seed_based_correlations)
-	print("seed-based correlation Fisher-z transformed: min = %.3f; max = %.3f" % (seed_based_correlations_fisher_z.min(),seed_based_correlations_fisher_z.max()))
-
-	seed_based_correlation_img = brain_masker.inverse_transform(seed_based_correlations_fisher_z.T)
-
-	if save_as:
-		seed_based_correlation_img.to_filename(save_as)
-
-	return seed_based_correlation_img
-
-def correlation_matrix(ts,
-	confounds=None,
-	labels_img='',
-	loud = False,
-	save_as = '',
-	):
-	"""Return a csv containing correlations between ROIs.
-
-	Parameters
-	----------
-
-	ts : string
-	Path to the 4D NIfTI timeseries file on which to perform the connectivity analysis.
-
-	labels_img: string
-	Path to a 3D NIfTI-like binary label file designating ROIs.
-
-	safe_as : str
-
-	confounds : 2D array OR path to CSV file
-	Array/CSV file containing confounding time-series to be regressed out before FC analysis.
-
-	"""
-	ts = path.abspath(path.expanduser(ts))
-	labels_img = path.abspath(path.expanduser(labels_img))
-
-	labels_masker = NiftiLabelsMasker(
-		labels_img=labels_img,
-		standardize=True,
-		memory='nilearn_cache',
-		verbose=5
-		)
-
-	#TODO: test confounds with physiological signals
-	if(confounds):
-		confounds = path.abspath(path.expanduser(confounds))
-		timeseries = labels_masker.fit_transform(ts, confounds=confounds)
+	data_selection['out_path'] = ''
+	if data_selection['path'].str.contains('.nii.gz').any():
+		data_selection['out_path'] = data_selection['path'].apply(lambda x: path.basename(path.splitext(path.splitext(x)[0])[0]+'_MELODIC'))
 	else:
-		timeseries = labels_masker.fit_transform(ts)
+		data_selection['out_path'] = data_selection['path'].apply(lambda x: path.basename(path.splitext(x)[0]+'_MELODIC'))
 
-	correlation_measure = ConnectivityMeasure(kind='correlation')
-	correlation_matrix = correlation_measure.fit_transform([timeseries])[0]
+	paths = data_selection['path']
 
-	if save_as:
-		np.savetxt(path.abspath(path.expanduser(save_as)), correlation_matrix, delimiter=',')
+	infosource = pe.Node(interface=util.IdentityInterface(fields=['path'], mandatory_inputs=False), name="infosource")
+	infosource.iterables = [('path', paths)]
 
-	return correlation_matrix
+	dummy_scans = pe.Node(name='dummy_scans', interface=util.Function(function=force_dummy_scans,input_names=inspect.getargspec(force_dummy_scans)[0], output_names=['out_file']))
+	dummy_scans.inputs.desired_dummy_scans = 10
+
+	bids_filename = pe.Node(name='bids_filename', interface=util.Function(function=out_path,input_names=inspect.getargspec(out_path)[0], output_names=['filename']))
+	bids_filename.inputs.selection_df = data_selection
+
+	bids_container = pe.Node(name='path_container', interface=util.Function(function=container,input_names=inspect.getargspec(container)[0], output_names=['container']))
+	bids_container.inputs.selection_df = data_selection
+
+	datasink = pe.Node(nio.DataSink(), name='datasink')
+	datasink.inputs.base_directory = path.abspath(path.join(bids_base,'..','diagnostic'))
+	datasink.inputs.parameterization = False
+
+	report_tr = pe.Node(name='report_tr', interface=util.Function(function=get_tr,input_names=inspect.getargspec(get_tr)[0], output_names=['tr']))
+	report_tr.inputs.ndim = 4
+
+	workflow_connections = [
+		(infosource, dummy_scans, [('path', 'in_file')]),
+		(infosource, bids_filename, [('path', 'in_path')]),
+		(bids_filename, bids_container, [('filename', 'out_path')]),
+		(bids_container, datasink, [('container', 'container')]),
+		(infosource, report_tr, [('path', 'in_file')]),
+		(report_tr, melodic, [('tr', 'tr_sec')]),
+		]
+
+
+	crashdump_dir = path.abspath(path.join(bids_base,'..','diagnostic_crashdump'))
+	workflow_config = {'execution': {'crashdump_dir': crashdump_dir}}
+	if debug:
+		workflow_config['logging'] = {
+			'workflow_level':'DEBUG',
+			'utils_level':'DEBUG',
+			'interface_level':'DEBUG',
+			'filemanip_level':'DEBUG',
+			'log_to_file':'true',
+			}
+
+	workdir_name = 'diagnostic_work'
+	workflow = pe.Workflow(name=workdir_name)
+	workflow.connect(workflow_connections)
+	workflow.base_dir = path.abspath(path.join(bids_base,'..'))
+	workflow.config = workflow_config
+	workflow.write_graph(dotfilename=path.join(workflow.base_dir,workdir_name,"graph.dot"), graph2use="hierarchical", format="png")
+
+	if not keep_work or not keep_crashdump:
+		try:
+			workflow.run(plugin="MultiProc", plugin_args={'n_procs' : n_procs})
+		except RuntimeError:
+			pass
+	else:
+		workflow.run(plugin="MultiProc", plugin_args={'n_procs' : n_procs})
+	if not keep_work:
+		shutil.rmtree(path.join(workflow.base_dir,workdir_name))
+	if not keep_crashdump:
+		try:
+			shutil.rmtree(crashdump_dir)
+		except FileNotFoundError:
+			pass
+
+	return
+

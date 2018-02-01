@@ -2,20 +2,31 @@
 
 from __future__ import print_function, division, unicode_literals, absolute_import
 
-STIM_PROTOCOL_DICTIONARY={
-	"EPI_BOLD_chr_longSOA":"chr_longSOA",
-	"EPI_BOLD_jb_long":"jb_long",
-	"EPI_CBV_alej":"alej",
-	"EPI_CBV_chr_longSOA":"chr_longSOA",
-	"EPI_CBV_chr_vlongSOA":"chr_vlongSOA",
-	"EPI_CBV_jb_long":"jb_long",
-	"EPI_CBV_jin6":"jin6",
-	"EPI_CBV_jin10":"jin10",
-	"EPI_CBV_jin20":"jin20",
-	"EPI_CBV_jin40":"jin40",
-	"EPI_CBV_jin60":"jin60",
-	"EPI_CBV_jp_phasic":"jp_phasic",
-	}
+def parse_paravision_date(pv_date):
+	"""Convert ParaVision-style datetime string to Python datetime object.
+
+	Parameters
+	----------
+
+	pv_date : str
+		ParaVision datetime string.
+
+	Returns
+	-------
+
+	`datetime.datetime` : A Python datetime object.
+
+	Notes
+	-----
+
+	The datetime object produced does not contain a timezone, and should therefor only be used to determine time deltas relative to other datetimes from the same session.
+	"""
+	from datetime import datetime
+
+	pv_date, _ = pv_date.split('+')
+	pv_date += "000"
+	pv_date = datetime.strptime(pv_date, "%Y-%m-%dT%H:%M:%S,%f")
+	return pv_date
 
 def fslmaths_invert_values(img_path):
 	"""Calculates the op_string required to make an fsl.ImageMaths() node invert an image"""
@@ -88,25 +99,88 @@ def datasource_exclude(in_files, excludes, output="files"):
 		return len(out_files)
 
 
+def bids_dict_to_dir(bids_dictionary):
+	"""Concatenate a (subject, session) or (subject, session, scan) tuple to a BIDS-style path"""
+	subject = "sub-" + bids_dictionary['subject']
+	session = "ses-" + bids_dictionary['session']
+	return "/".join([subject,session])
+
 def ss_to_path(subject_session):
 	"""Concatenate a (subject, session) or (subject, session, scan) tuple to a BIDS-style path"""
 	subject = "sub-" + subject_session[0]
 	session = "ses-" + subject_session[1]
 	return "/".join([subject,session])
 
-def sss_to_source(source_format, subject=False, session=False, scan=False, subject_session_scan=False, base_directory=False, groupby=False):
+def bids_dict_to_source(bids_dictionary, source_format):
 	from os import path
 
-	if any(a is False for a in [subject,session,scan]):
-		(subject,session,scan) = subject_session_scan
+	source = source_format.format(**bids_dictionary)
 
-	if groupby == "session":
-		source = source_format.format("*", session, "*")
-	else:
-		source = source_format.format(subject, session, scan)
-	if base_directory:
-		source = path.join(base_directory, source)
 	return source
+
+def out_path(selection_df, in_path,
+	in_field='path',
+	out_field='out_path',
+	):
+	"""Select the `out_path` field corresponding to a given `in_path` from a BIDS-style selection dataframe which includes an `out_path` column.
+	"""
+
+	out_path = selection_df[selection_df[in_field]==in_path][out_field].item()
+
+	return out_path
+
+def container(selection_df, out_path,
+	kind='',
+	out_field='out_path',
+	):
+
+	subject = selection_df[selection_df[out_field]==out_path]['subject'].item()
+	session = selection_df[selection_df[out_field]==out_path]['session'].item()
+
+	container = 'sub-{}/ses-{}'.format(subject,session)
+	if kind:
+		container += '/'
+		container += kind
+
+	return container
+
+def bids_naming(subject_session, scan_type, metadata,
+	extra=['acq'],
+	extension='.nii.gz',
+	suffix='',
+	):
+	"""
+	Generate a BIDS filename from a subject-and-session iterator, a scan type, and a `pandas.DataFrame` metadata container.
+	"""
+	subject, session = subject_session
+	filename = 'sub-{}'.format(subject)
+	filename += '_ses-{}'.format(session)
+	selection =  metadata[(metadata['subject']==subject)&(metadata['session']==session)&(metadata['scan_type']==scan_type)]
+	if selection.empty:
+		return
+	if 'acq' in extra:
+		acq = selection['acquisition']
+		if not acq.isnull().all():
+			acq = acq.item()
+			filename += '_acq-{}'.format(acq)
+	trial = selection['trial']
+	if not trial.isnull().all():
+		trial = trial.item()
+		filename += '_trial-{}'.format(trial)
+	if not suffix:
+		try:
+			modality = selection['modality']
+		except KeyError:
+			pass
+		else:
+			if not modality.isnull().all():
+				modality = modality.item()
+				filename += '_{}'.format(modality)
+	else:
+		filename += '_{}'.format(suffix)
+	filename += extension
+
+	return filename
 
 def sss_filename(subject_session, scan, scan_prefix="trial", suffix="", extension=".nii.gz"):
 	"""Concatenate subject-condition and scan inputs to a BIDS-style filename

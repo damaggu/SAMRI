@@ -2,48 +2,89 @@ import csv
 import inspect
 import os
 import re
+import json
 
-import nibabel as nb
+from copy import deepcopy
 import pandas as pd
-try:
-	from utils import STIM_PROTOCOL_DICTIONARY
-except ImportError:
-	from .utils import STIM_PROTOCOL_DICTIONARY
 
-def force_dummy_scans(in_file, scan_dir,
+BEST_GUESS_MODALITY_MATCH = {
+	('FLASH',):'T1w',
+	('TurboRARE','TRARE'):'T2w',
+	}
+BIDS_METADATA_EXTRACTION_DICTS = [
+	{'field_name':'EchoTime',
+		'query_file':'method',
+		'regex':r'^##\$EchoTime=(?P<value>.*?)$',
+		'scale': 1./1000.,
+		'type': float,
+		},
+	{'field_name':'FlipAngle',
+		'query_file':'visu_pars',
+		'regex':r'^##\$VisuAcqFlipAngle=(?P<value>.*?)$',
+		'type': float,
+		},
+	{'field_name':'Manufacturer',
+		'query_file':'configscan',
+		'regex':r'^##ORIGIN=(?P<value>.*?)$',
+		},
+	{'field_name':'NumberOfVolumesDiscardedByScanner',
+		'query_file':'method',
+		'regex':r'^##\$PVM_DummyScans=(?P<value>.*?)$',
+		'type': int,
+		},
+	{'field_name':'ReceiveCoilName',
+		'query_file':'configscan',
+		'regex':r'.*?,COILTABLE,1#\$Name,(?P<value>.*?)#\$Id.*?',
+		},
+	{'field_name':'PulseSequenceType',
+		'query_file':'method',
+		'regex':r'^##\$Method=<Bruker:(?P<value>.*?)>$',
+		},
+	]
+MODALITY_MATCH = {
+	('BOLD','bold','Bold'):'bold',
+	('CBV','cbv','Cbv'):'cbv',
+	('T1','t1'):'T1w',
+	('T2','t2'):'T2w',
+	('MTon','MtOn'):'MTon',
+	('MToff','MtOff'):'MToff',
+	}
+
+def force_dummy_scans(in_file,
 	desired_dummy_scans=10,
 	out_file="forced_dummy_scans_file.nii.gz",
 	):
 	"""Take a scan and crop initial timepoints depending upon the number of dummy scans (determined from a Bruker scan directory) and the desired number of dummy scans.
 
 	in_file : string
-	Path to the 4D NIfTI file for which to force dummy scans.
-
-	scan_dir : string
-	Path to the corresponding Bruker directory of the scan_dir.
+	BIDS-compliant path to the 4D NIfTI file for which to force dummy scans.
 
 	desired_dummy_scans : int , optional
 	Desired timepoints dummy scans.
 	"""
 
+	import json
 	import nibabel as nib
 	from os import path
 
 	out_file = path.abspath(path.expanduser(out_file))
+	in_file = path.abspath(path.expanduser(in_file))
+	in_file_base = path.splitext(in_file)[0]
+	metadata_file = in_file_base+'.json'
 
-	method_file_path = path.join(scan_dir,"method")
-	method_file = open(method_file_path, "r")
+	metadata = json.load(open(metadata_file))
+
 	dummy_scans = 0
-	while True:
-		current_line = method_file.readline()
-		if "##$PVM_DummyScans=" in current_line:
-			dummy_scans = int(current_line.split("=")[1])
-			break
+	try:
+		dummy_scans = metadata['NumberOfVolumesDiscardedByScanner']
+	except:
+		pass
 
 	delete_scans = desired_dummy_scans - dummy_scans
 
 	if delete_scans <= 0:
-		out_file = in_file
+		img = nib.load(in_file)
+		nib.save(img,out_file)
 	else:
 		img = nib.load(in_file)
 		img_ = nib.Nifti1Image(img.get_data()[...,delete_scans:], img.affine, img.header)
@@ -51,200 +92,347 @@ def force_dummy_scans(in_file, scan_dir,
 
 	return out_file
 
-def write_function_call(frame, target_path):
-	args, _, _, values = inspect.getargvalues(frame)
-	function_name = inspect.getframeinfo(frame)[2]
-	function_call = function_name+"("
-	for arg in args:
-		arg_value = values[arg]
-		if isinstance(arg_value, str):
-			arg_value = "\'"+arg_value+"\'"
-		else:
-			arg_value = str(arg_value)
-		arg_entry=arg+"="+arg_value+","
-		function_call+=arg_entry
-	function_call+=")"
-	target = open(target_path, 'w')
-	target.write(function_call)
-	target.close()
+def get_tr(in_file,
+	ndim=4,
+	):
+	"""Return the repetiton time of a NIfTI file.
 
-def write_events_file(scan_dir, scan_type, stim_protocol_dictionary,
-	db_path="~/syncdata/meta.db",
-	out_file="events.tsv",
-	dummy_scans_ms="determine",
-	subject_delay=False,
-	very_nasty_bruker_delay_hack=False,
+	Parameters
+	----------
+
+	in_file : str
+		Path to NIfTI file
+	ndim : int
+		Dimensionality of NIfTI file
+
+	Returns
+	-------
+
+	float :
+		Repetition Time
+	"""
+
+	import nibabel as nib
+	from os import path
+
+	in_file = path.abspath(path.expanduser(in_file))
+
+	img = nib.load(in_file)
+	header = img.header
+	tr = header.get_zooms()[ndim-1]
+
+	return tr
+
+def write_bids_metadata_file(scan_dir, extraction_dicts,
+	out_file="bids_metadata.json",
 	):
 
-	import csv
-	import sys
-	from copy import deepcopy
-	from datetime import datetime
+	import json
+	import re
 	from os import path
-	import pandas as pd
-	import numpy as np
-	from labbookdb.db.query import loadSession
-	from labbookdb.db.common_classes import LaserStimulationProtocol
+	from samri.pipelines.utils import parse_paravision_date
 
 	out_file = path.abspath(path.expanduser(out_file))
+	scan_dir = path.abspath(path.expanduser(scan_dir))
+	metadata = {}
 
-	if not subject_delay:
-		scan_dir = path.abspath(path.expanduser(scan_dir))
-		state_file_path = path.join(scan_dir,"AdjStatePerScan")
-
-		#Here we read the `AdjStatePerScan` file, which may be missing if no adjustments were run at the beginning of this scan
-		try:
-			state_file = open(state_file_path, "r")
-		except IOError:
-			delay_seconds = 0
-		else:
-			while True:
-				current_line = state_file.readline()
-				if "AdjScanStateTime" in current_line:
-					delay_datetime_line = state_file.readline()
+	# Extract nice parameters:
+	for extraction_dict in extraction_dicts:
+		query_file = path.abspath(path.join(scan_dir,extraction_dict['query_file']))
+		with open(query_file) as search:
+			for line in search:
+				if re.match(extraction_dict['regex'], line):
+					m = re.match(extraction_dict['regex'], line)
+					value = m.groupdict()['value']
+					try:
+						value = extraction_dict['type'](value)
+					except KeyError:
+						pass
+					try:
+						value = value * extraction_dict['scale']
+					except KeyError:
+						pass
+					metadata[extraction_dict['field_name']] = value
 					break
-
-			trigger_time, scanstart_time = [datetime.utcnow().strptime(i.split("+")[0], "<%Y-%m-%dT%H:%M:%S,%f") for i in delay_datetime_line.split(" ")]
-			delay = scanstart_time-trigger_time
-			delay_seconds=delay.total_seconds()
-			if very_nasty_bruker_delay_hack:
-				delay_seconds += 12
-
-		#Here we read the `method` file, which contains info about dummy scans
-		method_file_path = path.join(scan_dir,"method")
-		method_file = open(method_file_path, "r")
-
-		read_variables=0 #count variables so that breaking takes place after both have been read
-
-		if dummy_scans_ms == "determine":
-			while True:
-				current_line = method_file.readline()
-				if "##$PVM_DummyScans=" in current_line:
-					dummy_scans = int(current_line.split("=")[1])
-					read_variables +=1 #count variables
-				if "##$PVM_DummyScansDur=" in current_line:
-					dummy_scans_ms = int(current_line.split("=")[1])
-					read_variables +=1 #count variables
-				if read_variables == 2:
-					break #prevent loop from going on forever
-
-		subject_delay = delay_seconds + dummy_scans_ms/1000
-
+	# Extract DelayAfterTrigger
 	try:
-		trial_code = stim_protocol_dictionary[scan_type]
-	except KeyError:
-		return
+		query_file = path.abspath(path.join(scan_dir,'AdjStatePerScan'))
+		read_line = False
+		with open(query_file) as search:
+			for line in search:
+				if '##$AdjScanStateTime=( 2 )' in line:
+					read_line = True
+					continue
+				if read_line:
+					m = re.match(r'^<(?P<value>.*?)> <.*?>$', line)
+					adjustments_start = m.groupdict()['value']
+					adjustments_start = parse_paravision_date(adjustments_start)
+					break
+	except IOError:
+		pass
+	else:
+		query_file = path.abspath(path.join(scan_dir,'acqp'))
+		with open(query_file) as search:
+			for line in search:
+				if re.match(r'^##\$ACQ_time=<.*?>$', line):
+					m = re.match(r'^##\$ACQ_time=<(?P<value>.*?)>$', line)
+					adjustments_end = m.groupdict()['value']
+					adjustments_end = parse_paravision_date(adjustments_end)
+					break
+		adjustments_duration = adjustments_end - adjustments_start
+		metadata['DelayAfterTrigger'] = adjustments_duration.total_seconds()
 
-	session, engine = loadSession(db_path)
-	sql_query=session.query(LaserStimulationProtocol).filter(LaserStimulationProtocol.code==trial_code)
-	mystring = sql_query.statement
-	mydf = pd.read_sql_query(mystring,engine)
-	delay = int(mydf["stimulation_onset"][0])
-	inter_stimulus_duration = int(mydf["inter_stimulus_duration"][0])
-	stimulus_duration = mydf["stimulus_duration"][0]
-	stimulus_repetitions = mydf["stimulus_repetitions"][0]
-
-	onsets=[]
-	names=[]
-	with open(out_file, 'w') as tsvfile:
-		field_names =["onset","duration","stimulation_frequency"]
-		writer = csv.DictWriter(tsvfile, fieldnames=field_names, delimiter=str("\t")) #we use str() to avoid `TypeError: "delimiter" must be string, not unicode`
-
-		writer.writeheader()
-		for i in range(stimulus_repetitions):
-			events={}
-			onset = delay+(inter_stimulus_duration+stimulus_duration)*i
-			events["onset"] = onset-subject_delay
-			events["duration"] = stimulus_duration
-			events["stimulation_frequency"] = stimulus_duration
-			writer.writerow(events)
+	with open(out_file, 'w') as out_file_writeable:
+		json.dump(metadata, out_file_writeable, indent=1)
+		out_file_writeable.write("\n")  # `json.dump` does not add a newline at the end; we do it here.
 
 	return out_file
 
-def get_subjectinfo(subject_delay, scan_type, scan_types):
-	from nipype.interfaces.base import Bunch
-	import pandas as pd
-	import numpy as np
-	from copy import deepcopy
+
+def write_events_file(scan_dir,
+	db_path="~/syncdata/meta.db",
+	metadata_file='',
+	out_file="events.tsv",
+	prefer_labbookdb=False,
+	timecourse_file='',
+	trial='',
+	):
+	"""Adjust a BIDS event file to reflect delays introduced after the trigger and before the scan onset.
+
+	Parameters
+	----------
+
+	scan_dir : str
+		ParaVision scan directory path.
+	db_path : str, optional
+		LabbookDB database file path from which to source the evets profile for the identifier assigned to the `trial` parameter.
+	metadata_file : str, optional
+		Path to a BIDS metadata file.
+	out_file : str, optional
+		Path to which to write the adjusted events file
+	prefer_labbookdb : bool, optional
+		Whether to query the events file in the LabbookDB database file first (rather than look for the events file in the scan directory).
+	timecourse_file : str, optional
+		Path to a NIfTI file.
+	trial : str, optional
+		Trial identifier from a LabbookDB database.
+
+	Returns
+	-------
+
+	str : Path to which the adjusted events file was saved.
+	"""
+
+	import csv
 	import sys
-	sys.path.append('/home/chymera/src/LabbookDB/db/')
-	from query import loadSession
-	from common_classes import LaserStimulationProtocol
-	db_path="~/syncdata/meta.db"
-
-	session, engine = loadSession(db_path)
-
-	sql_query=session.query(LaserStimulationProtocol).filter(LaserStimulationProtocol.code==scan_types[scan_type])
-	mystring = sql_query.statement
-	mydf = pd.read_sql_query(mystring,engine)
-	delay = int(mydf["stimulation_onset"][0])
-	inter_stimulus_duration = int(mydf["inter_stimulus_duration"][0])
-	stimulus_duration = mydf["stimulus_duration"][0]
-	stimulus_repetitions = mydf["stimulus_repetitions"][0]
-
-	onsets=[]
-	names=[]
-	for i in range(stimulus_repetitions):
-		onset = delay+(inter_stimulus_duration+stimulus_duration)*i
-		onsets.append([onset])
-		names.append("s"+str(i+1))
-	output = []
-	for idx_a, a in enumerate(onsets):
-		for idx_b, b in enumerate(a):
-			onsets[idx_a][idx_b] = round(b-subject_delay, 2) #floating point values don't add up nicely, so we have to round (https://docs.python.org/2/tutorial/floatingpoint.html)
-	output.append(Bunch(conditions=names,
-					onsets=deepcopy(onsets),
-					durations=[[stimulus_duration]]*stimulus_repetitions
-					))
-	return output
-
-def stimulus_protocol_bunch(eventfile_path):
-	eventfile_df = pd.read_csv(eventfile_path)
-
-def bids_inputs(input_root, categories=[], participants=[], scan_types=[]):
+	import json
 	import os
-	l2_inputs = []
-	for dirName, subdirList, fileList in os.walk(input_root, topdown=False):
-		if subdirList == []:
-			for my_file in fileList:
-				candidate_l2_input = os.path.join(dirName,my_file)
-				#the following string additions are performed to not accidentally match longer identifiers which include the shorter identifiers actually queried for. The path formatting is taken from the glm.py level1() datasync node, and will not work if that is modified.
-				if not "/anat/" in candidate_l2_input and candidate_l2_input[-11:] != "_events.tsv":
-					if (any("ses-"+c in candidate_l2_input for c in categories) or not categories) and (any("sub-"+p in candidate_l2_input for p in participants) or not participants) and (any("scan_type_"+s+"/" in candidate_l2_input for s in scan_types) or not scan_types):
-						l2_inputs.append(candidate_l2_input)
+	import pandas as pd
+	import nibabel as nib
+	import numpy as np
+	from datetime import datetime
 
-	return l2_inputs
+	out_file = os.path.abspath(os.path.expanduser(out_file))
+	scan_dir = os.path.abspath(os.path.expanduser(scan_dir))
+	db_path = os.path.abspath(os.path.expanduser(db_path))
 
+	if not prefer_labbookdb:
+		try:
+			scan_dir_contents = os.listdir(scan_dir)
+			sequence_files = [i for i in scan_dir_contents if "sequence" in i and "tsv" in i]
+			sequence_file = os.path.join(scan_dir, sequence_files[0])
+			mydf = pd.read_csv(sequence_file, sep="\s")
+		except IndexError:
+			if os.path.isfile(db_path):
+				from labbookdb.report.tracking import bids_eventsfile
+				mydf = bids_eventsfile(db_path, trial)
+			else:
+				return '/dev/null'
+	else:
+		try:
+			if os.path.isfile(db_path):
+				from labbookdb.report.tracking import bids_eventsfile
+				mydf = bids_eventsfile(db_path, trial)
+			else:
+				return '/dev/null'
+		except ImportError:
+			scan_dir_contents = os.listdir(scan_dir)
+			sequence_files = [i for i in scan_dir_contents if "sequence" in i and "tsv" in i]
+			sequence_file = os.path.join(scan_dir, sequence_files[0])
+			mydf = pd.read_csv(sequence_file, sep="\s")
 
-def get_level2_inputs(input_root, categories=[], participants=[], scan_types=[]):
-	import os
-	l2_inputs = []
-	for dirName, subdirList, fileList in os.walk(input_root, topdown=False):
-		if subdirList == []:
-			for my_file in fileList:
-				candidate_l2_input = os.path.join(dirName,my_file)
-				#the following string additions are performed to not accidentally match longer identifiers which include the shorter identifiers actually queried for. The path formatting is taken from the glm.py level1() datasync node, and will not work if that is modified.
-				if (any(os.path.join(input_root,c)+"." in candidate_l2_input for c in categories) or not categories) and (any("."+p+"/" in candidate_l2_input for p in participants) or not participants) and (any("scan_type_"+s+"/" in candidate_l2_input for s in scan_types) or not scan_types):
-					l2_inputs.append(candidate_l2_input)
+	if metadata_file and timecourse_file:
+		timecourse_file = os.path.abspath(os.path.expanduser(timecourse_file))
+		metadata_file = os.path.abspath(os.path.expanduser(metadata_file))
 
-	return l2_inputs
+		timecourse = nib.load(timecourse_file)
+		zooms = timecourse.header.get_zooms()
+		tr = zooms[-1]
+		with open(metadata_file) as metadata:
+			    metadata = json.load(metadata)
+		delay = 0
+		try:
+			delay += metadata['NumberOfVolumesDiscardedByScanner'] / float(tr)
+		except:
+			pass
+		try:
+			delay += metadata['DelayAfterTrigger']
+		except:
+			pass
+		mydf['onset'] = mydf['onset'] - delay
 
-def get_scan(measurements_base, data_selection, scan_type, selector=None, subject=None, session=None):
+	mydf.to_csv(out_file, sep=str('\t'), index=False)
+
+	return out_file
+
+def get_scan(measurements_base, data_selection,
+	scan_type="",
+	selector=None,
+	subject=None,
+	session=None,
+	trial=False,
+	):
+	"""Return the path to a Bruker scan selected by subject, session, and scan type, based on metadata previously extracted with `samri.preprocessing.extra_functions.get_data_selection()`.
+
+	Parameters
+	----------
+	measurements_base : str
+		Path to the measurements base path (this is simply prepended to the variable part of the path).
+	data_selection : pandas.DataFrame
+		A `pandas.DataFrame` object as produced by `samri.preprocessing.extra_functions.get_data_selection()`.
+	scan_type : str
+		The type of scan for which to determine the directory.
+	selector : iterable, optional
+		The first method of selecting the subject and scan, this value should be a length-2 list or tuple containing the subject and sthe session to be selected.
+	subject : string, optional
+		This has to be defined if `selector` is not defined. The subject for which to return a scan directory.
+	session : string, optional
+		This has to be defined if `selector` is not defined. The session for which to return a scan directory.
+	"""
 	import os #for some reason the import outside the function fails
 	import pandas as pd
-	scan_paths = []
+
 	if not subject:
 		subject = selector[0]
 	if not session:
 		session = selector[1]
-	filtered_data = data_selection[(data_selection["session"] == session)&(data_selection["subject"] == subject)&(data_selection["scan_type"] == scan_type)]
-	measurement_path = filtered_data["measurement"].tolist()[0]
-	scan_subdir = filtered_data["scan"].tolist()[0]
+	filtered_data = data_selection[(data_selection["session"] == session)&(data_selection["subject"] == subject)]
+	if trial:
+		filtered_data = filtered_data[filtered_data["trial"] == trial]
+	if scan_type:
+		filtered_data = filtered_data[filtered_data["scan_type"] == scan_type]
+	measurement_path = filtered_data["measurement"].item()
+	scan_subdir = filtered_data["scan"].item()
 	scan_path = os.path.join(measurements_base,measurement_path,scan_subdir)
-	return scan_path, scan_type
 
-def get_data_selection(workflow_base, sessions=[], scan_types=[], subjects=[], exclude_subjects=[], measurements=[], exclude_measurements=[]):
-	import os
+	if not trial:
+		trial = filtered_data['trial'].item()
+
+	return scan_path, scan_type, trial
+
+BIDS_KEY_DICTIONARY = {
+	'acquisition':['acquisition','ACQUISITION','acq','ACQ'],
+	'trial':['trial','TRIAL','stim','STIM','stimulation','STIMULATION'],
+	}
+
+def assign_modality(scan_type, record):
+	"""Add a modality column with a corresponding value to a `pandas.DataFrame` object.
+
+	Parameters
+	----------
+	scan_type: str
+		A string potentially containing a modality identifier.
+	record: pandas.DataFrame
+		A `pandas.Dataframe` object.
+
+	Returns
+	-------
+	An updated `pandas.DataFrame` obejct.
+	"""
+	for modality_group in MODALITY_MATCH:
+		for modality_string in modality_group:
+			if modality_string in scan_type:
+				record['modality'] = MODALITY_MATCH[modality_group]
+				return scan_type, record
+	for modality_group in BEST_GUESS_MODALITY_MATCH:
+		for modality_string in modality_group:
+			if modality_string in scan_type:
+				record['modality'] = BEST_GUESS_MODALITY_MATCH[modality_group]
+				return scan_type, record
+	return scan_type, record
+
+def match_exclude_ss(entry, match, exclude, record, key):
+	try:
+		exclude_list = exclude[key]
+	except KeyError:
+		exclude_list = []
+	try:
+		match_list = match[key]
+	except KeyError:
+		match_list = []
+	if entry not in exclude_list:
+		if len(match_list) > 0 and entry not in match_list:
+			return False
+		else:
+			record[key] = str(entry).strip(' ')
+		return True
+	else:
+		return False
+
+def match_exclude_bids(key, values, record, scan_type, number):
+	key_alternatives = BIDS_KEY_DICTIONARY[key]
+	for alternative in key_alternatives:
+		if alternative in scan_type:
+			for value in values:
+				match_string = r'(^|.*?_|.*? ){alternative}-{value}( .*?|_.*?|$)'.format(alternative=alternative,value=value)
+				if re.match(match_string, scan_type):
+					record['scan_type'] = str(scan_type).strip(' ')
+					record['scan'] = str(int(number))
+					record[key] = str(value).strip(' ')
+					scan_type, record = assign_modality(scan_type, record)
+					for key_ in BIDS_KEY_DICTIONARY:
+						for alternative_ in BIDS_KEY_DICTIONARY[key_]:
+							if alternative_ in scan_type:
+								match_string_ = r'(^|.*?_|.*? ){}-(?P<value>\w+?)( .*?|_.*?|$)'.format(alternative_)
+								m = re.match(match_string_, scan_type)
+								try:
+									value_ = m.groupdict()['value']
+								except AttributeError:
+									pass
+								else:
+									record[key_] = str(value_).strip(' ')
+					return True
+	return False
+
+def get_data_selection(workflow_base,
+	match={},
+	exclude={},
+	measurements=[],
+	exclude_measurements=[],
+	):
+	"""
+	Return a `pandas.DaaFrame` object of the Bruker measurement directories located under a given base directory, and their respective scans, subjects, and trials.
+
+	Parameters
+	----------
+	workflow_base : str
+		The path in which to query for Bruker measurement directories.
+	match : dict
+		A dictionary of matching criteria.
+		The keys of this dictionary must be full BIDS key names (e.g. "trial" or "acquisition"), and the values must be strings (e.g. "CogB") which, combined with the respective BIDS key, identify scans to be included (e.g. scans, the names of which containthe string "trial-CogB" - delimited on either side by an underscore or the limit of the string).
+	exclude : dict, optional
+		A dictionary of exclusion criteria.
+		The keys of this dictionary must be full BIDS key names (e.g. "trial" or "acquisition"), and the values must be strings (e.g. "CogB") which, combined with the respective BIDS key, identify scans to be excluded(e.g. a scans, the names of which contain the string "trial-CogB" - delimited on either side by an underscore or the limit of the string).
+	measurements : list of str, optional
+		A list of measurement directory names to be included exclusively (i.e. whitelist).
+		If the list is empty, all directories (unless explicitly excluded via `exclude_measurements`) will be queried.
+	exclude_measurements : list of str, optional
+		A list of measurement directory names to be excluded from querying (i.e. a blacklist).
+
+	Notes
+	-----
+	This data selector function is robust to `ScanProgram.scanProgram` files which have been truncated before the first detected match, but not to files truncated after at least one match.
+	"""
 
 	workflow_base = os.path.abspath(os.path.expanduser(workflow_base))
 
@@ -257,7 +445,7 @@ def get_data_selection(workflow_base, sessions=[], scan_types=[], subjects=[], e
 	#populate a list of lists with acceptable subject names, sessions, and sub_dir's
 	for sub_dir in measurement_path_list:
 		if sub_dir not in exclude_measurements:
-			selected_measurement = []
+			selected_measurement = {}
 			try:
 				state_file = open(os.path.join(workflow_base,sub_dir,"subject"), "r")
 				read_variables=0 #count variables so that breaking takes place after both have been read
@@ -265,74 +453,93 @@ def get_data_selection(workflow_base, sessions=[], scan_types=[], subjects=[], e
 					current_line = state_file.readline()
 					if "##$SUBJECT_name_string=" in current_line:
 						entry=re.sub("[<>\n]", "", state_file.readline())
-						if entry not in exclude_subjects:
-							if len(subjects) > 0 and entry not in subjects:
-								break
-							else:
-								selected_measurement.append(entry)
-						else:
+						if not match_exclude_ss(entry, match, exclude, selected_measurement, 'subject'):
 							break
 						read_variables +=1 #count recorded variables
 					if "##$SUBJECT_study_name=" in current_line:
 						entry=re.sub("[<>\n]", "", state_file.readline())
-						if entry in sessions or len(sessions) == 0:
-							selected_measurement.append(entry)
-						else:
+						if not match_exclude_ss(entry, match, exclude, selected_measurement, 'session'):
 							break
 						read_variables +=1 #count recorded variables
 					if read_variables == 2:
-						selected_measurement.append(sub_dir)
-						#if the directory passed both the subject and sessions tests, append a line for it
-						if not scan_types:
-							#add two empty entries to fill columns otherwise dedicated to the scan program
-							selected_measurement.extend(["",""])
-							selected_measurements.append(selected_measurement)
-						#if various scan types are selected extend and copy lines to accommodate:
-						else:
-							for scan_type in scan_types:
-								#make a shallow copy of the list:
-								measurement_copy = selected_measurement[:]
-								scan_number=None
+						selected_measurement['measurement'] = sub_dir
+						scan_program_file = os.path.join(workflow_base,sub_dir,"ScanProgram.scanProgram")
+						scan_dir_resolved = False
+						try:
+							with open(scan_program_file) as search:
+								for line in search:
+									measurement_copy = deepcopy(selected_measurement)
+									if re.match(r'^[ \t]+<displayName>[a-zA-Z0-9-_]+? \(E\d+\)</displayName>[\r\n]+', line):
+										m = re.match(r'^[ \t]+<displayName>(?P<scan_type>.+?) \(E(?P<number>\d+)\)</displayName>[\r\n]+', line)
+										number = m.groupdict()['number']
+										scan_type = m.groupdict()['scan_type']
+										for key in match:
+											if match_exclude_bids(key, match[key], measurement_copy, scan_type, number):
+												selected_measurements.append(measurement_copy)
+												scan_dir_resolved = True
+												break
+							if not scan_dir_resolved:
+								raise IOError()
+						except IOError:
+							for sub_sub_dir in os.listdir(os.path.join(workflow_base,sub_dir)):
+								measurement_copy = deepcopy(selected_measurement)
+								acqp_file_path = os.path.join(workflow_base,sub_dir,sub_sub_dir,"acqp")
+								scan_subdir_resolved = False
 								try:
-									scan_program_file_path = os.path.join(workflow_base,sub_dir,"ScanProgram.scanProgram")
-									scan_program_file = open(scan_program_file_path, "r")
-									syntax_adjusted_scan_type = ">"+scan_type+" "
-									while True:
-										current_line = scan_program_file.readline()
-										if syntax_adjusted_scan_type in current_line:
-											scan_number = current_line.split(syntax_adjusted_scan_type)[1].strip("(E").strip(")</displayName>\n")
-											measurement_copy.extend([scan_type, scan_number])
-											selected_measurements.append(measurement_copy)
-											break
-										#avoid infinite while loop:
-										if "</de.bruker.mri.entities.scanprogram.StudyScanProgramEntity>" in current_line:
-											break
+									with open(acqp_file_path,'r') as search:
+										for line in search:
+											if scan_subdir_resolved:
+												break
+											if re.match(r'^(?!/)<[a-zA-Z0-9-_]+?>[\r\n]+', line):
+												number = sub_sub_dir
+												m = re.match(r'^(?!/)<(?P<scan_type>.+?)>[\r\n]+', line)
+												scan_type = m.groupdict()['scan_type']
+												for key in match:
+													if match_exclude_bids(key, match[key], measurement_copy, scan_type, number):
+														selected_measurements.append(measurement_copy)
+														scan_subdir_resolved = True
+														break
+										else:
+											pass
 								except IOError:
 									pass
-								#If the ScanProgram.scanProgram file is small in size and the scan_type could not be matched, that may be because ParaVision failed
-								#to write all the information into the file. This happens occasionally.
-								#Thus we scan the individual acquisition protocols as well. These are a suboptimal and second choice, because acqp scans **also**
-								#keep the original names the sequences had on import (and may thus be misleading, if the name was changed by the user after import).
-								if os.stat(scan_program_file_path).st_size <= 700 and not scan_number:
-									for sub_sub_dir in os.listdir(os.path.join(workflow_base,sub_dir)):
-										try:
-											acqp_file = os.path.join(workflow_base,sub_dir,sub_sub_dir,"acqp")
-											if "<"+scan_type+">" in open(acqp_file).read():
-												scan_number = sub_sub_dir
-												measurement_copy.extend([scan_type, scan_number])
-												selected_measurements.append(measurement_copy)
-										except IOError:
-											pass
 						break #prevent loop from going on forever
 			except IOError:
 				pass
 
-	data_selection = pd.DataFrame(selected_measurements, columns=["subject", "session", "measurement", "scan_type", "scan"])
-
-	#drop subjects which do not have measurements for all sessions
-	if len(sessions) > 1:
-		for subject in set(data_selection["subject"]):
-			if len(data_selection[(data_selection["subject"] == subject)]) < len(sessions):
-				data_selection = data_selection[(data_selection["subject"] != subject)]
-
+	data_selection = pd.DataFrame(selected_measurements)
 	return data_selection
+
+
+def select_from_datafind_df(df,
+	bids_dictionary=False,
+	bids_dictionary_override=False,
+	output_key='path',
+	failsafe=False,
+	list_output=False,
+	):
+
+
+	if bids_dictionary_override:
+		override = [i for i in bids_dictionary_override.keys()]
+	else:
+		override = []
+	override.append(output_key)
+
+	if bids_dictionary:
+		for key in bids_dictionary:
+			if not key in override:
+				df=df[df[key]==bids_dictionary[key]]
+	if bids_dictionary_override:
+		for key in bids_dictionary_override:
+				df=df[df[key]==bids_dictionary_override[key]]
+
+	if list_output:
+		selection = df[output_key].tolist()
+	else:
+		if failsafe:
+			df = df.iloc[0]
+		selection = df[output_key].item()
+
+	return selection
+

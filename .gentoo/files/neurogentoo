@@ -1,6 +1,0 @@
-[neurogentoo]
-location = /usr/local/portage/neurogentoo
-sync-type = git
-sync-uri = https://github.com/TheChymera/neurogentoo.git
-priority=8888
-

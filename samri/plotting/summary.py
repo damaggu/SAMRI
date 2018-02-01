@@ -16,12 +16,8 @@ from nipype.interfaces.io import DataFinder
 from os import path
 from statsmodels.sandbox.stats.multicomp import multipletests
 
-from samri.report.roi import roi_per_session
-from samri.utilities import add_roi_data, add_pattern_data
-try:
-	import maps, timeseries
-except ImportError:
-	from ..plotting import maps, timeseries
+from samri.report.utilities import add_roi_data, add_pattern_data
+from samri.plotting import maps, timeseries
 
 try: FileNotFoundError
 except NameError:
@@ -67,6 +63,64 @@ def plot_roi_per_session(subjectdf, voxeldf,
 		plt.savefig(path.abspath(path.expanduser(save_as)))
 
 
+def fc_per_session(substitutions, analytic_pattern,
+	legend_loc="best",
+	t_file_template="~/ni_data/ofM.dr/l1/{l1_dir}/sub-{subject}/ses-{session}/sub-{subject}_ses-{session}_trial-{scan}_tstat.nii.gz",
+	figure="per-participant",
+	tabref="tab",
+	xy_label=[],
+	color="#E69F00",
+	saveas=False,
+	):
+	"""Plot a ROI t-values over the session timecourse
+
+	analytic_pattern : str
+	Path to the analytic pattern by which to multiply the per-participant per-session t-statistic maps.
+	"""
+
+	if isinstance(analytic_pattern,str):
+		analytic_pattern = path.abspath(path.expanduser(analytic_pattern))
+	analytic_pattern = nib.load(analytic_pattern)
+	pattern_data = analytic_pattern.get_data()
+
+	if figure == "per-participant":
+		voxels = False
+	else:
+		voxels = True
+
+	n_jobs = mp.cpu_count()-2
+	roi_data = Parallel(n_jobs=n_jobs, verbose=0, backend="threading")(map(delayed(add_pattern_data),
+		substitutions,
+		[t_file_template]*len(substitutions),
+		[pattern_data]*len(substitutions),
+		[voxels]*len(substitutions),
+		))
+	subject_dfs, voxel_dfs = zip(*roi_data)
+	subjectdf = pd.concat(subject_dfs)
+
+	model = smf.mixedlm("t ~ session", subjectdf, groups=subjectdf["subject"])
+	fit = model.fit()
+	report = fit.summary()
+
+	# create a restriction for every regressor - except intercept (first) and random effects (last)
+	omnibus_tests = np.eye(len(fit.params))[1:-1]
+	anova = fit.f_test(omnibus_tests)
+
+	names_for_plotting = {"ofM":u"naïve", "ofM_aF":"acute", "ofM_cF1":"chronic (2w)", "ofM_cF2":"chronic (4w)", "ofM_pF":"post"}
+	if voxels:
+		voxeldf = pd.concat(voxel_dfs)
+		voxeldf = voxeldf.replace({"session": names_for_plotting})
+	subjectdf = subjectdf.replace({"session": names_for_plotting})
+
+	ax = sns.pointplot(x="session", y="t", data=subjectdf, ci=68.3, dodge=True, jitter=True, legend_out=False, units="subject", color=color)
+	if xy_label:
+		ax.set(xlabel=xy_label[0], ylabel=xy_label[1])
+
+	if(saveas):
+		plt.savefig(saveas)
+
+	return fit, anova
+
 def analytic_pattern_per_session(substitutions, analytic_pattern,
 	legend_loc="best",
 	t_file_template="~/ni_data/ofM.dr/l1/{l1_dir}/sub-{subject}/ses-{session}/sub-{subject}_ses-{session}_trial-{scan}_tstat.nii.gz",
@@ -74,7 +128,6 @@ def analytic_pattern_per_session(substitutions, analytic_pattern,
 	figure="per-participant",
 	tabref="tab",
 	xy_label=[],
-	obfuscate=False,
 	color="#E69F00",
 	saveas=False,
 	):
@@ -107,10 +160,7 @@ def analytic_pattern_per_session(substitutions, analytic_pattern,
 	subject_dfs, voxel_dfs = zip(*roi_data)
 	subjectdf = pd.concat(subject_dfs)
 
-	if obfuscate:
-		obf_session = {"ofM":"_pre","ofM_aF":"t1","ofM_cF1":"t2","ofM_cF2":"t3","ofM_pF":"post"}
-		subjectdf = subjectdf.replace({"session": obf_session})
-		subjectdf.to_csv("~/MixedLM_data.csv")
+	return subjectdf
 
 	model = smf.mixedlm("t ~ session", subjectdf, groups=subjectdf["subject"])
 	fit = model.fit()
@@ -136,7 +186,7 @@ def analytic_pattern_per_session(substitutions, analytic_pattern,
 	return fit, anova
 
 def responders(l2_dir,
-	roi="ctx_chr",
+	roi="DSURQEc_ctx",
 	data_root="~/ni_data/ofM.dr",
 	roi_root="~/ni_data/templates/roi"
 	):
@@ -166,6 +216,7 @@ def responders(l2_dir,
 			voxel_data["t"]=i
 			df_ = pd.DataFrame(voxel_data, index=[None])
 			voxeldf = pd.concat([voxeldf,df_])
+	voxeldf.to_csv('{}/ctx_responders.csv'.format(data_path))
 
 def p_roi_masking(substitution, ts_file_template, beta_file_template, p_file_template, design_file_template, event_file_template, p_level, brain_mask):
 	"""Apply a substitution pattern to timecourse, beta, and design file templates - and mask the data of the former two according to a roi. Subsequently scale the design by the mean beta.
@@ -246,7 +297,7 @@ def p_roi_masking(substitution, ts_file_template, beta_file_template, p_file_tem
 
 	return timecourse, design, mask_map, event_df, subplot_title
 
-def roi_masking(substitution, ts_file_template, beta_file_template, design_file_template, event_file_template, roi_path):
+def roi_masking(substitution, ts_file_template, beta_file_template, design_file_template, event_file_template, roi):
 	"""Apply a substitution pattern to timecourse, beta, and design file templates - and mask the data of the former two according to a roi. Subsequently scale the design by the mean beta.
 
 	Parameters
@@ -288,14 +339,18 @@ def roi_masking(substitution, ts_file_template, beta_file_template, design_file_
 	design_file = path.expanduser(design_file_template.format(**substitution))
 	event_file = path.expanduser(event_file_template.format(**substitution))
 
-	masker = NiftiMasker(mask_img=roi_path)
-	mask_map = nib.load(roi_path)
+	masker = NiftiMasker(mask_img=roi)
+	if isinstance(roi, str):
+		mask_map = nib.load(roi)
+	else:
+		mask_map = roi
 	try:
 		timecourse = masker.fit_transform(ts_file).T
 		betas = masker.fit_transform(beta_file).T
 		design = pd.read_csv(design_file, skiprows=5, sep="\t", header=None, index_col=False)
 		event_df = pd.read_csv(event_file, sep="\t")
 	except ValueError:
+		print('Not found',ts_file,beta_file,design_file,event_file)
 		return None,None,None,None,None
 	subplot_title = "\n ".join([str(substitution["subject"]),str(substitution["session"])])
 	timecourse = np.mean(timecourse, axis=0)
@@ -303,7 +358,7 @@ def roi_masking(substitution, ts_file_template, beta_file_template, design_file_
 
 	return timecourse, design, mask_map, event_df, subplot_title
 
-def ts_overviews(substitutions, roi_path,
+def ts_overviews(substitutions, roi,
 	ts_file_template="~/ni_data/ofM.dr/preprocessing/{preprocessing_dir}/sub-{subject}/ses-{session}/func/sub-{subject}_ses-{session}_trial-{scan}.nii.gz",
 	beta_file_template="~/ni_data/ofM.dr/l1/{l1_dir}/sub-{subject}/ses-{session}/sub-{subject}_ses-{session}_trial-{scan}_cope.nii.gz",
 	design_file_template="~/ni_data/ofM.dr/l1/{l1_workdir}/_subject_session_scan_{subject}.{session}.{scan}/modelgen/run0.mat",
@@ -314,7 +369,10 @@ def ts_overviews(substitutions, roi_path,
 	stat_maps = []
 	subplot_titles = []
 	designs = []
-	roi_path = path.expanduser(roi_path)
+	try:
+		roi = path.abspath(path.expanduser(roi))
+	except AttributeError:
+		pass
 
 	n_jobs = mp.cpu_count()-2
 	substitutions_data = Parallel(n_jobs=n_jobs, verbose=0, backend="threading")(map(delayed(roi_masking),
@@ -323,7 +381,7 @@ def ts_overviews(substitutions, roi_path,
 		[beta_file_template]*len(substitutions),
 		[design_file_template]*len(substitutions),
 		[event_file_template]*len(substitutions),
-		[roi_path]*len(substitutions),
+		[roi]*len(substitutions),
 		))
 	timecourses, designs, stat_maps, event_dfs, subplot_titles = zip(*substitutions_data)
 
